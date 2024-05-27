@@ -34,6 +34,8 @@ class EtherFiBidsExporter():
         self.winning_bids = Gauge('etherfi_bids_winning', 'Number of winning etherfi bids', labelnames=['bidder_address'])
         self.active_bids = Gauge('etherfi_bids_active', 'Number of active etherfi bids', labelnames=['bidder_address'])
         self.cancelled_bids = Gauge('etherfi_bids_cancelled', 'Number of cancelled etherfi bids', labelnames=['bidder_address'])
+        self.ready_validators = Gauge('etherfi_bids_validtors_ready', 'Number of ready validators enabled by bids')
+        self.live_validators = Gauge('etherfi_bids_validators_live', 'Number of live validators enabled by bids')
     
     def do(self):
         logger.info('Doing EtherFi Bids Exporter')
@@ -94,6 +96,14 @@ class EtherFiBidsExporter():
                         blockNumber
                         blockTimestamp
                         transactionHash
+                        validator{
+                            id
+                            phase
+                            validatorPubKey
+                            blockNumber
+                            blockTimestamp
+                            transactionHash
+                        }
                     }
                 }
                 ''' % (self.bidder_address, start, start + interval, interval)
@@ -124,7 +134,7 @@ class EtherFiBidsExporter():
         cursor = conn.cursor()
         
         cursor.execute('''
-        CREATE TABLE IF NOT EXISTS bids (
+        CREATE TABLE IF NOT EXISTS Bid (
             id TEXT PRIMARY KEY,
             bidderAddress TEXT,
             pubKeyIndex INTEGER,
@@ -135,10 +145,21 @@ class EtherFiBidsExporter():
             transactionHash TEXT
         )
         ''')
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS Validator (
+            bid_id TEXT PRIMARY KEY,
+            phase TEXT,
+            pubKey Text,
+            blockNumber INTEGER,
+            blockTimestamp INTEGER,
+            transactionHash TEXT,
+            FOREIGN KEY (bid_id) REFERENCES Bid (id)
+        )
+        ''')
 
         for bid in self.bids:
             cursor.execute('''
-            INSERT OR REPLACE INTO bids (id, bidderAddress, pubKeyIndex, status, amount, blockNumber, blockTimestamp, transactionHash) 
+            INSERT OR REPLACE INTO Bid (id, bidderAddress, pubKeyIndex, status, amount, blockNumber, blockTimestamp, transactionHash) 
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 bid['id'],
@@ -151,12 +172,29 @@ class EtherFiBidsExporter():
                 bid['transactionHash']
             ))
 
+            validator = bid.get('validator')
+            if not validator:
+                continue
+
+            cursor.execute('''
+            INSERT OR REPLACE INTO Validator (bid_id, phase, pubKey, blockNumber, blockTimestamp, transactionHash)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ''', (
+                bid['id'],
+                validator['phase'],
+                validator['validatorPubKey'],
+                validator['blockNumber'],
+                validator['blockTimestamp'],
+                validator['transactionHash'],
+            ))
+
         conn.commit()
         logger.info(f'Recorded Bids: {len(self.bids)}')
 
-        cursor.execute('''
+        cursor.execute(f'''
         SELECT status, COUNT(*)
-        FROM bids
+        FROM Bid
+        WHERE bidderAddress = '{self.bidder_address}' COLLATE NOCASE
         GROUP BY status
         ''')
         rows = cursor.fetchall()
@@ -164,7 +202,7 @@ class EtherFiBidsExporter():
         status_counts = {status: 0 for status in ['WON', 'ACTIVE', 'CANCELLED']}
         for status, count in rows:
             if status not in status_counts:
-                logger.info(f'Unknown Bids Status: {status} ({count})')
+                logger.info(f'Unknown Bid Status: {status} ({count})')
                 break
             status_counts[status] = count
         
@@ -178,6 +216,30 @@ class EtherFiBidsExporter():
             elif status == 'CANCELLED':
                 self.cancelled_bids.labels(bidder_address=self.bidder_address).set(count)
                 logger.info(f'Cancelled Bids: {count}')
+        
+        cursor.execute(f'''
+        SELECT Validator.phase, COUNT(*)
+        FROM Validator
+        JOIN Bid ON Bid.id = Validator.bid_id
+        WHERE Bid.bidderAddress = '{self.bidder_address}' COLLATE NOCASE
+        GROUP BY Validator.phase
+        ''')
+        rows = cursor.fetchall()
+
+        phase_counts = {phase: 0 for phase in ['READY_FOR_DEPOSIT', 'LIVE']}
+        for phase, count in rows:
+            if phase not in phase_counts:
+                logger.info(f'Unknown Validator Phase: {phase} ({count})')
+                break
+            phase_counts[phase] = count
+        
+        for phase, count in phase_counts.items():
+            if phase == 'READY_FOR_DEPOSIT':
+                self.ready_validators.set(count)
+                logger.info(f'Ready Validtaors: {count}')
+            elif phase == 'LIVE':
+                self.live_validators.set(count)
+                logger.info(f'Live Validators: {count}')
 
         conn.close()
 
