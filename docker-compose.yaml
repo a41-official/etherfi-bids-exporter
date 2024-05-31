@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
   etherfi-bids-exporter:
-    image: a41ventures/etherfi-bids-exporter:${EXPORTER_VERSION:-v0.1.0}
+    image: a41ventures/etherfi-bids-exporter:${EXPORTER_VERSION}
     container_name: etherfi-bids-exporter
     restart: unless-stopped
     environment:
