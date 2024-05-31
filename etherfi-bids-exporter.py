@@ -34,8 +34,7 @@ class EtherFiBidsExporter():
         self.winning_bids = Gauge('etherfi_bids_winning', 'Number of winning etherfi bids', labelnames=['bidder_address'])
         self.active_bids = Gauge('etherfi_bids_active', 'Number of active etherfi bids', labelnames=['bidder_address'])
         self.cancelled_bids = Gauge('etherfi_bids_cancelled', 'Number of cancelled etherfi bids', labelnames=['bidder_address'])
-        self.ready_validators = Gauge('etherfi_bids_validators_ready', 'Number of ready validators enabled by bids')
-        self.live_validators = Gauge('etherfi_bids_validators_live', 'Number of live validators enabled by bids')
+        self.validators_phase = Gauge('etherfi_bids_validators_phase', 'Number of validators enabled by bids per phase', labelnames=['phase'])
     
     def do(self):
         logger.info('Doing EtherFi Bids Exporter')
@@ -226,20 +225,9 @@ class EtherFiBidsExporter():
         ''')
         rows = cursor.fetchall()
 
-        phase_counts = {phase: 0 for phase in ['READY_FOR_DEPOSIT', 'LIVE']}
         for phase, count in rows:
-            if phase not in phase_counts:
-                logger.info(f'Unknown Validator Phase: {phase} ({count})')
-                break
-            phase_counts[phase] = count
-        
-        for phase, count in phase_counts.items():
-            if phase == 'READY_FOR_DEPOSIT':
-                self.ready_validators.set(count)
-                logger.info(f'Ready Validtaors: {count}')
-            elif phase == 'LIVE':
-                self.live_validators.set(count)
-                logger.info(f'Live Validators: {count}')
+            self.validators_phase.labels(phase=phase.lower()).set(count)
+            logger.info(f'Phase {phase} Validators: {count}')
 
         conn.close()
 
