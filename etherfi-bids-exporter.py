@@ -34,7 +34,7 @@ class EtherFiBidsExporter():
         self.winning_bids = Gauge('etherfi_bids_winning', 'Number of winning etherfi bids', labelnames=['bidder_address'])
         self.active_bids = Gauge('etherfi_bids_active', 'Number of active etherfi bids', labelnames=['bidder_address'])
         self.cancelled_bids = Gauge('etherfi_bids_cancelled', 'Number of cancelled etherfi bids', labelnames=['bidder_address'])
-        self.ready_validators = Gauge('etherfi_bids_validtors_ready', 'Number of ready validators enabled by bids')
+        self.ready_validators = Gauge('etherfi_bids_validators_ready', 'Number of ready validators enabled by bids')
         self.live_validators = Gauge('etherfi_bids_validators_live', 'Number of live validators enabled by bids')
     
     def do(self):
