@@ -26,11 +26,10 @@ class EtherFiBidsExporter():
         self.bidder_address = bidder_address
         self.api_url = api_url
         self.fetching_bids_interval_minutes = fetching_bids_interval_minutes
-        self.bids = list()
 
         self.api_health = Gauge('etherfi_bids_api_health', 'API status of etherFi bids')
-        self.active_bids_min = Gauge('etherfi_bids_amount_min', 'Minimum amount of bids', labelnames=['status'])
-        self.active_bids_max = Gauge('etherfi_bids_amount_max', 'Maximum amount of bids', labelnames=['status'])
+        self.bids_amount_min = Gauge('etherfi_bids_amount_min', 'Minimum amount of bids', labelnames=['bidder_address', 'status'])
+        self.bids_amount_max = Gauge('etherfi_bids_amount_max', 'Maximum amount of bids', labelnames=['bidder_address', 'status'])
         self.winning_bids = Gauge('etherfi_bids_winning', 'Number of winning etherfi bids', labelnames=['bidder_address'])
         self.active_bids = Gauge('etherfi_bids_active', 'Number of active etherfi bids', labelnames=['bidder_address'])
         self.cancelled_bids = Gauge('etherfi_bids_cancelled', 'Number of cancelled etherfi bids', labelnames=['bidder_address'])
@@ -39,51 +38,20 @@ class EtherFiBidsExporter():
     def do(self):
         logger.info('Doing EtherFi Bids Exporter')
         while True:
-            self.fetch_active_bids_min_max()
-            self.fetch_our_bids()
-            self.record_our_bids()
+            self.record_bids()
+            self.get_our_bids()
+            self.get_active_bids()
+            self.get_validators_phase()
             logger.info(f'Sleeping {self.fetching_bids_interval_minutes}min')
             time.sleep(self.fetching_bids_interval_minutes * 60)
-    
-    def fetch_active_bids_min_max(self):
-        response = requests.post(self.api_url, json={
-            'query': '''
-            {
-                activeBidsMin: bids(where: {status: "ACTIVE"}, orderBy: amount, orderDirection: asc, first: 1) {
-                    amount
-                }
-                activeBidsMax: bids(where: {status: "ACTIVE"}, orderBy: amount, orderDirection: desc, first: 1) {
-                    amount
-                }
-            }
-            '''
-        }, headers={
-            'Content-Type': 'application/json'
-        })
 
-        if response.status_code != 200:
-            logger.info(f'Failed API Response [{response.status_code}] {response.text}')
-            self.api_health.set(0)
-            return None
-
-        min_amount = response.json()['data']['activeBidsMin'][0]['amount']
-        self.active_bids_min.labels(status='active').set(min_amount)
-        logger.info(f'Minimum Amount of Active Bids: {min_amount}')
-
-        max_amount = response.json()['data']['activeBidsMax'][0]['amount']
-        self.active_bids_max.labels(status='active').set(max_amount)
-        logger.info(f'Maximum Amount of Acitve Bids: {max_amount}')
-
-        self.api_health.set(1)
-
-    def fetch_our_bids(self):
-        self.bids = list()
+    def record_bids(self):
         all_bids = list()
         start = 0
         interval = 1000
 
         while True:
-            response = requests.post(self.api_url, json={
+            result = self.api_post_request(json_payload={
                 'query': '''
                 {
                     bids(where: {bidderAddress: "%s", pubKeyIndex_gte: "%s", pubKeyIndex_lt: "%s"}, first: %d) {
@@ -106,29 +74,18 @@ class EtherFiBidsExporter():
                     }
                 }
                 ''' % (self.bidder_address, start, start + interval, interval)
-            }, headers={
-                'Content-Type': 'application/json'
             })
 
-            if response.status_code != 200:
-                logger.info(f'Failed API Response [{response.status_code}] {response.text}')
-                self.api_health.set(0)
-                return None
-
-            body = response.json()
-            if ('data' not in body) or ('bids' not in body.get('data')) or (len(body.get('data').get('bids')) < 1):
+            if ('data' not in result) or ('bids' not in result.get('data')) or (len(result.get('data').get('bids')) < 1):
                 break
-
-            bids = body['data']['bids']
+            
+            bids = result['data']['bids']
             all_bids.extend(bids)
             start += interval
-
-        self.bids = sorted(all_bids,  key=lambda x: int(x['pubKeyIndex']))
-        logger.info(f'Fetcted Bids: {len(self.bids)}')
         
-        self.api_health.set(1)
-    
-    def record_our_bids(self):
+        all_bids = sorted(all_bids, key=lambda x: int(x['pubKeyIndex']))
+        logger.info(f'Fetcted Bids: {len(all_bids)}')
+
         conn = sqlite3.connect(os.path.join(os.path.dirname(__file__), 'etherfi-bids.db'))
         cursor = conn.cursor()
         
@@ -156,7 +113,7 @@ class EtherFiBidsExporter():
         )
         ''')
 
-        for bid in self.bids:
+        for bid in all_bids:
             cursor.execute('''
             INSERT OR REPLACE INTO Bid (id, bidderAddress, pubKeyIndex, status, amount, blockNumber, blockTimestamp, transactionHash) 
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -188,7 +145,12 @@ class EtherFiBidsExporter():
             ))
 
         conn.commit()
-        logger.info(f'Recorded Bids: {len(self.bids)}')
+        conn.close()
+        logger.info(f'Recorded Bids: {len(all_bids)}')
+
+    def get_our_bids(self):
+        conn = sqlite3.connect(os.path.join(os.path.dirname(__file__), 'etherfi-bids.db'))
+        cursor = conn.cursor()
 
         cursor.execute(f'''
         SELECT status, COUNT(*)
@@ -202,7 +164,7 @@ class EtherFiBidsExporter():
         for status, count in rows:
             if status not in status_counts:
                 logger.info(f'Unknown Bid Status: {status} ({count})')
-                break
+                continue
             status_counts[status] = count
         
         for status, count in status_counts.items():
@@ -215,7 +177,68 @@ class EtherFiBidsExporter():
             elif status == 'CANCELLED':
                 self.cancelled_bids.labels(bidder_address=self.bidder_address).set(count)
                 logger.info(f'Cancelled Bids: {count}')
-        
+
+        conn.close()
+
+    def get_active_bids(self):
+        result = self.api_post_request(json_payload={
+            'query': '''
+            {
+                othersMin: bids(where: {bidderAddress_not: "%s", status: "ACTIVE"}, orderBy: amount, orderDirection: asc, first: 1) {
+                    bidderAddress
+                    amount
+                }
+                othersMax: bids(where: {bidderAddress_not: "%s", status: "ACTIVE"}, orderBy: amount, orderDirection: desc, first: 1) {
+                    bidderAddress
+                    amount
+                }
+            }
+            ''' % (self.bidder_address, self.bidder_address)
+        })
+
+        if ('data' not in result) or ('othersMin' not in result.get('data')) or ('othersMax' not in result.get('data')) or (len(result.get('data').get('othersMin')) < 1) or (len(result.get('data').get('othersMax')) < 1):
+            return
+
+        others_min_bidder = result['data']['othersMin'][0]['bidderAddress']
+        others_min_amount = result['data']['othersMin'][0]['amount']
+        self.bids_amount_min.labels(bidder_address=others_min_bidder, status='active').set(others_min_amount)
+        logger.info(f'Minimum Amount of Others Active Bids by {others_min_bidder}: {others_min_amount}')
+
+        others_max_bidder = result['data']['othersMax'][0]['bidderAddress']
+        others_max_amount = result['data']['othersMax'][0]['amount']
+        self.bids_amount_max.labels(bidder_address=others_max_bidder, status='active').set(others_max_amount)
+        logger.info(f'Maximum Amount of Others Active Bids by {others_max_bidder}: {others_max_amount}')
+
+        conn = sqlite3.connect(os.path.join(os.path.dirname(__file__), 'etherfi-bids.db'))
+        cursor = conn.cursor()
+
+        cursor.execute(f'''
+        SELECT MIN(amount), MAX(amount)
+        FROM Bid
+        WHERE bidderAddress = '{self.bidder_address}' COLLATE NOCASE
+            AND status = 'ACTIVE'
+        ''')
+        row = cursor.fetchone()
+        conn.close()
+
+        our_min_amount = 0
+        our_max_amount = 0
+
+        if row:
+            our_min_amount, our_max_amount = row
+        else:
+            logger.info(f'No Our Active Bids in DB')
+
+        self.bids_amount_min.labels(bidder_address=self.bidder_address, status='active').set(our_min_amount)
+        logger.info(f'Minimum Amount of Our Active Bids by {self.bidder_address}: {our_min_amount}')
+
+        self.bids_amount_max.labels(bidder_address=self.bidder_address, status='active').set(our_max_amount)
+        logger.info(f'Maximum Amount of Our Active Bids by {self.bidder_address}: {our_max_amount}')
+
+    def get_validators_phase(self):
+        conn = sqlite3.connect(os.path.join(os.path.dirname(__file__), 'etherfi-bids.db'))
+        cursor = conn.cursor()
+
         cursor.execute(f'''
         SELECT Validator.phase, COUNT(*)
         FROM Validator
@@ -225,11 +248,34 @@ class EtherFiBidsExporter():
         ''')
         rows = cursor.fetchall()
 
+        phase_counts = {phase: 0 for phase in ['NOT_INITIALIZED', 'STAKE_DEPOSITED', 'WAITING_FOR_APPROVAL', 'LIVE', 'BEING_SLASHED', 'EXITED', 'FULLY_WITHDRAWN', 'CANCELLED', 'EVICTED', 'READY_FOR_DEPOSIT']}
         for phase, count in rows:
+            if phase not in phase_counts:
+                logger.info(f'Unknown Validator Phase: {phase} ({count})')
+                continue
+            phase_counts[phase] = count
+
+        for phase, count in phase_counts.items():
             self.validators_phase.labels(phase=phase.lower()).set(count)
             logger.info(f'Phase {phase} Validators: {count}')
 
         conn.close()
+
+    def api_post_request(self, json_payload):
+        response = requests.post(
+            self.api_url, 
+            headers={'Content-Type': 'application/json'},
+            json=json_payload,
+            timeout=10
+        )
+
+        if response.status_code != 200:
+            logger.info(f'Failed API Response [{response.status_code}] {response.text}')
+            self.api_health.set(0)
+            return None
+        
+        self.api_health.set(1)
+        return response.json()
 
 def main():
     logger.info('Starting Etherfi Bids Exporter')
